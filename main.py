@@ -36,7 +36,10 @@ def safe_request(session: requests.Session, method: str, url: str, retries: int 
                 time.sleep(backoff)
                 backoff *= 2
 
-    print(f"Failed to fetch {url!r} after {retries} attempts.")
+    if last_exc is not None:
+        print(f"Failed to fetch {url!r} after {retries} attempts. Last error: {last_exc!r}")
+    else:
+        print(f"Failed to fetch {url!r} after {retries} attempts.")
     return None
 
 
@@ -117,7 +120,8 @@ def get_courses(session: requests.Session) -> list[dict[str, str]]:
     course_tags = soup.select(".courseList--coursesForTerm a.courseBox[href^='/courses/']")
     if not course_tags:
         course_tags = soup.select("a.courseBox")
-    print(f"DEBUG: Found {len(course_tags)} potential course anchors")
+    # DEBUG 输出已注释，如需调试请临时取消注释
+    # print(f"DEBUG: Found {len(course_tags)} potential course anchors")
     for tag in course_tags:
         if isinstance(tag, Tag):
             course_name_tag = tag.find("div", class_="courseBox--name")
@@ -271,6 +275,13 @@ def send_notification(assignments: list[dict[str, str]]) -> None:
         print("No assignments to notify; skipping email.")
         return
 
+    # 为静态类型收窄：运行至此说明变量均非空
+    assert isinstance(host, str)
+    assert isinstance(user, str)
+    assert isinstance(password, str)
+    assert isinstance(to_addr, str)
+    assert isinstance(from_addr, str)
+
     # 组装正文
     lines = [f"共发现未提交作业 {len(assignments)} 项："]
     for i, a in enumerate(assignments, start=1):
@@ -315,12 +326,9 @@ def send_notification(assignments: list[dict[str, str]]) -> None:
         finally:
             if server:
                 try:
-                    server.quit()
+                    server.close()
                 except Exception:
-                    try:
-                        server.close()
-                    except Exception:
-                        pass
+                    pass
     else:
         server = None
         try:
@@ -339,12 +347,9 @@ def send_notification(assignments: list[dict[str, str]]) -> None:
         finally:
             if server:
                 try:
-                    server.quit()
+                    server.close()
                 except Exception:
-                    try:
-                        server.close()
-                    except Exception:
-                        pass
+                    pass
 
 
 # --- 主程序入口 ---
@@ -384,19 +389,19 @@ if __name__ == "__main__":
                             assignment['course_name'] = course['name'] # Add course name to assignment info
                         all_unsubmitted_assignments.extend(unsubmitted_assignments)
 
-                # 如果需要强制测试邮件（例如当前没有未提交作业），
-                # 可通过设置环境变量 `SMTP_FORCE_TEST=1` 来注入一条测试作业。
-                if not all_unsubmitted_assignments and os.getenv("SMTP_FORCE_TEST") == "1":
-                    print("INFO: SMTP_FORCE_TEST=1 detected — injecting test assignment for email test.")
-                    all_unsubmitted_assignments = [
-                        {
-                            "course_name": "测试课程",
-                            "name": "测试作业",
-                            "status": "No Submission",
-                            "due_date": "N/A",
-                            "link": "https://www.gradescope.com"
-                        }
-                    ]
+                # 测试注入逻辑已注释（不再在生产环境自动注入假作业）。
+                # 如需再次启用，可临时取消下面的注释块。
+                # if not all_unsubmitted_assignments and os.getenv("SMTP_FORCE_TEST") == "1":
+                #     print("INFO: SMTP_FORCE_TEST=1 detected — injecting test assignment for email test.")
+                #     all_unsubmitted_assignments = [
+                #         {
+                #             "course_name": "测试课程",
+                #             "name": "测试作业",
+                #             "status": "No Submission",
+                #             "due_date": "N/A",
+                #             "link": "https://www.gradescope.com"
+                #         }
+                #     ]
 
                 if not all_unsubmitted_assignments:
                     print("\nNo unsubmitted assignments found in any course. Great job!")
