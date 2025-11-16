@@ -2,6 +2,9 @@ import requests
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 import os
+import smtplib
+from email.message import EmailMessage
+import time
 
 # --- 常量定义 ---
 # Gradescope 的主页和登录相关的 URL
@@ -10,17 +13,42 @@ LOGIN_URL = f"{BASE_URL}/login"
 
 # --- 核心功能 ---
 
+
+def safe_request(session: requests.Session, method: str, url: str, retries: int = 2, timeout: int = 10, backoff: int = 1, **kwargs):
+    """
+    A small wrapper around session.get/post that adds timeout and simple retries.
+
+    Returns the Response on success, or None on persistent failure.
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            if method.lower() == "get":
+                resp = session.get(url, timeout=timeout, **kwargs)
+            else:
+                resp = session.post(url, timeout=timeout, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"Request error ({method.upper()}) {url!r} attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(backoff)
+                backoff *= 2
+
+    print(f"Failed to fetch {url!r} after {retries} attempts.")
+    return None
+
+
 def login_to_gradescope(session, email, password):
     """
     处理登录逻辑，返回一个保持登录状态的 session 对象。
     """
     # 1. GET 请求：访问登录页面
     print("正在访问登录页面...")
-    try:
-        get_response = session.get(LOGIN_URL)
-        get_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"访问登录页面失败: {e}")
+    get_response = safe_request(session, "get", LOGIN_URL)
+    if get_response is None:
+        print("访问登录页面失败: 多次尝试均未成功。")
         return None
 
     # 2. 解析 HTML，并以最健壮的方式找到 authenticity_token
@@ -49,11 +77,9 @@ def login_to_gradescope(session, email, password):
 
     # 4. 发送 POST 请求，完成登录
     print("正在提交登录信息...")
-    try:
-        post_response = session.post(LOGIN_URL, data=payload)
-        post_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"提交登录信息失败: {e}")
+    post_response = safe_request(session, "post", LOGIN_URL, data=payload)
+    if post_response is None:
+        print("提交登录信息失败: 多次尝试均未成功。")
         return None
 
     # 5. 验证登录是否成功
@@ -80,11 +106,9 @@ def get_courses(session: requests.Session) -> list[dict[str, str]]:
         and contains 'name' and 'url'.
     """
     courses_url = "https://www.gradescope.com/account"
-    try:
-        response = session.get(courses_url)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching courses page: {e}")
+    response = safe_request(session, "get", courses_url)
+    if response is None:
+        print("Error fetching courses page: 多次尝试均未成功。")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -139,12 +163,10 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
         unsubmitted assignment and contains its name, link, status, and due date.
     """
     print(f"Fetching assignments from {course_url}...")
-    try:
-        # Use the provided course_url
-        response = session.get(course_url)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching assignments page: {e}")
+    # Use safe_request with retries and timeout
+    response = safe_request(session, "get", course_url)
+    if response is None:
+        print(f"Error fetching assignments page for {course_url}: 多次尝试均未成功。")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -227,7 +249,102 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
     return unsubmitted_assignments
 
 def send_notification(assignments: list[dict[str, str]]) -> None:
-    pass
+    host = os.getenv("SMTP_HOST")
+    port_str = os.getenv("SMTP_PORT", "465")
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASSWORD")
+    to_addr = os.getenv("SMTP_TO")
+    from_addr = os.getenv("SMTP_FROM") or user
+    debug = os.getenv("SMTP_DEBUG") == "1"
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"Error: SMTP_PORT must be an integer, got {port_str!r}")
+        return
+
+    # 基础校验
+    if not all([host, port, user, password, to_addr, from_addr]):
+        print("Error: Missing SMTP environment variables (SMTP_HOST/PORT/USER/PASSWORD/TO).")
+        return
+    if not assignments:
+        print("No assignments to notify; skipping email.")
+        return
+
+    # 组装正文
+    lines = [f"共发现未提交作业 {len(assignments)} 项："]
+    for i, a in enumerate(assignments, start=1):
+        course = a.get("course_name", "(未识别课程)")
+        name = a.get("name", "(未识别作业)")
+        status = a.get("status", "")
+        due = a.get("due_date", "")
+        link = a.get("link", "")
+        lines.append(f"{i}. 课程: {course}")
+        lines.append(f"   作业: {name}")
+        if status:
+            lines.append(f"   状态: {status}")
+        if due:
+            lines.append(f"   截止: {due}")
+        if link:
+            lines.append(f"   链接: {link}")
+        lines.append("-" * 20)
+    body = "\n".join(lines)
+
+    subject = f"[Gradescope] 未提交作业 {len(assignments)} 项"
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.set_content(body)
+
+    # 建立连接并发送，区分 SSL(465) 与 STARTTLS(587)
+    if port == 465:
+        server = None
+        try:
+            server = smtplib.SMTP_SSL(host, port, timeout=15)
+            if debug:
+                server.set_debuglevel(1)
+                print(f"SMTP DEBUG: using SSL connect to {host}:{port}")
+            server.ehlo()
+            server.login(user, password)
+            server.send_message(msg)
+            print("Notification email sent.")
+        except Exception as e:
+            print("Error during SMTP SSL send:", repr(e))
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    try:
+                        server.close()
+                    except Exception:
+                        pass
+    else:
+        server = None
+        try:
+            server = smtplib.SMTP(host, port, timeout=15)
+            if debug:
+                server.set_debuglevel(1)
+                print(f"SMTP DEBUG: using STARTTLS connect to {host}:{port}")
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(user, password)
+            server.send_message(msg)
+            print("Notification email sent.")
+        except Exception as e:
+            print("Error during SMTP STARTTLS send:", repr(e))
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    try:
+                        server.close()
+                    except Exception:
+                        pass
 
 
 # --- 主程序入口 ---
@@ -267,6 +384,20 @@ if __name__ == "__main__":
                             assignment['course_name'] = course['name'] # Add course name to assignment info
                         all_unsubmitted_assignments.extend(unsubmitted_assignments)
 
+                # 如果需要强制测试邮件（例如当前没有未提交作业），
+                # 可通过设置环境变量 `SMTP_FORCE_TEST=1` 来注入一条测试作业。
+                if not all_unsubmitted_assignments and os.getenv("SMTP_FORCE_TEST") == "1":
+                    print("INFO: SMTP_FORCE_TEST=1 detected — injecting test assignment for email test.")
+                    all_unsubmitted_assignments = [
+                        {
+                            "course_name": "测试课程",
+                            "name": "测试作业",
+                            "status": "No Submission",
+                            "due_date": "N/A",
+                            "link": "https://www.gradescope.com"
+                        }
+                    ]
+
                 if not all_unsubmitted_assignments:
                     print("\nNo unsubmitted assignments found in any course. Great job!")
                 else:
@@ -277,5 +408,8 @@ if __name__ == "__main__":
                         print(f"  Status: {assignment['status']}")
                         print(f"  Due Date: {assignment['due_date']}")
                         print("-" * 20)
+
+                    # 打印全部条目后只发送一次邮件通知（避免重复发送）
+                    send_notification(all_unsubmitted_assignments)
         else:
             print("Login failed.")
