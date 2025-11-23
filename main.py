@@ -228,11 +228,8 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
                     status_classes = []
 
                 # --- 智能筛选逻辑 ---
-                # 条件1: 状态是 "Submitted"
-                if 'submissionStatus-complete' in status_classes:
-                    is_completed = True
-                # 条件2: 状态是已评分 (文本中包含分数)
-                elif '/' in status_text and any(char.isdigit() for char in status_text):
+                # 状态不是 "No Submission"
+                if "No Submission" not in status_text:
                     is_completed = True
         
         # 截止日期单元格是倒数第二个 <td>
