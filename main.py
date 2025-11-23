@@ -194,7 +194,7 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
 
                 # --- 全新的、更健壮的信息提取与筛选逻辑 ---
 
-        # 1. 提取名称和链接 (这部分逻辑是正确的，保持不变)
+        # 1. 提取名称和链接
         name, link = None, None
         name_th = row.find("th", scope="row")
         if isinstance(name_th, Tag):
@@ -205,8 +205,12 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
                 if isinstance(href, str):
                     link = BASE_URL + href
         
-        if not name or not link:
+        if not name:
             continue
+
+        if not link:
+            # 如果没有作业链接（常见于未提交或未开放的作业），使用课程链接作为回退
+            link = course_url
 
         # 2. 重新设计的状态和日期提取
         is_completed = False
@@ -219,13 +223,6 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
             status_td = all_tds[0]
             if isinstance(status_td, Tag):
                 status_text = status_td.get_text(strip=True)
-                raw_classes = status_td.get("class")
-                if isinstance(raw_classes, list):
-                    status_classes = [str(cls) for cls in raw_classes]
-                elif isinstance(raw_classes, str):
-                    status_classes = [raw_classes]
-                else:
-                    status_classes = []
 
                 # --- 智能筛选逻辑 ---
                 # 状态不是 "No Submission"
