@@ -198,39 +198,50 @@ def get_assignments(session: requests.Session, course_url: str) -> list[dict[str
         href = link_a.get("href") if link_a else None
         link = BASE_URL + href if isinstance(href, str) else course_url
 
-        # 4. 提取截止日期并进行时间比对 (关键修复点)
+        # 4. 提取所有截止日期并取最晚的一个
         due_date_text = "N/A"
         is_too_late = False
         
-        # 改为在整个 row 里面找，而不是死板地找某个 td
-        time_tag = row.find("time", class_="submissionTimeChart--dueDate")
+        # 找出该行内所有截止日期标签
+        time_tags = row.find_all("time", class_="submissionTimeChart--dueDate")
         
-        if isinstance(time_tag, Tag):
-            datetime_str = time_tag.get("datetime")
-            due_date_text = time_tag.get_text(strip=True)
-
-            if isinstance(datetime_str, str):
+        parsed_dates = []
+        for t in time_tags:
+            dt_str = t.get("datetime")
+            if isinstance(dt_str, str):
                 try:
-                    # 格式化时间字符串
-                    iso_str = datetime_str[:10] + "T" + datetime_str[11:]
-                    if " " in iso_str:
-                        iso_str = iso_str.replace(" ", "")
+                    # 解析逻辑
+                    iso_str = dt_str[:10] + "T" + dt_str[11:]
+                    iso_str = iso_str.replace(" ", "")
                     if "+" in iso_str and ":" not in iso_str[-5:]:
                         iso_str = iso_str[:-2] + ":" + iso_str[-2:]
-                        
-                    due_dt = datetime.fromisoformat(iso_str)
-
-                    # 核心判断
-                    if now > (due_dt + timedelta(hours=24)):
-                        print(f"  [过滤] 作业 '{name}' 已过期超过 24h (截止于: {due_date_text})")
-                        is_too_late = True
-                    else:
-                        print(f"  [保留] 作业 '{name}' 尚未过期或在24h宽限期内 (截止于: {due_date_text})")
+                    
+                    parsed_dates.append({
+                        "dt": datetime.fromisoformat(iso_str),
+                        "text": t.get_text(strip=True)
+                    })
                 except Exception as e:
-                    print(f"  [错误] 解析日期失败 '{datetime_str}': {e}")
+                    print(f"  [错误] 解析日期失败 '{dt_str}': {e}")
+
+        if parsed_dates:
+            # 找到最晚的一个日期（如果有 Late Due Date，通常它比 Due Date 晚）
+            latest_info = max(parsed_dates, key=lambda x: x["dt"])
+            max_due_dt = latest_info["dt"]
+            due_date_text = latest_info["text"]
+
+            # 如果存在多个日期，且最晚的是 Late Due Date，可以在显示上做个标记
+            if len(parsed_dates) > 1:
+                due_date_text += " (含 Late Deadline)"
+
+            # 核心判断：以最晚的截止时间为准，增加 24h 宽限期
+            if now > (max_due_dt + timedelta(hours=24)):
+                print(f"  [过滤] 作业 '{name}' 所有提交机会（含迟交）均已过期超过 24h")
+                is_too_late = True
+            else:
+                # 只要还有一个截止日期没过期（或在宽限期内），就保留
+                pass 
         else:
-            # 调试日志：如果找不到 time 标签，输出一下这一行的内容
-            print(f"  [警告] 作业 '{name}' 没找到截止时间标签，请检查网页结构。")
+            print(f"  [警告] 作业 '{name}' 未找到任何时间标签")
 
         if not is_too_late:
             unsubmitted_assignments.append({
