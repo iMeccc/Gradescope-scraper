@@ -33,7 +33,5 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          # 可选调试：设为 '1' 输出 SMTP 对话（仅在需要时）
-          SMTP_DEBUG: ${{ secrets.SMTP_DEBUG }}
         run: |
           python main.py

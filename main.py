@@ -5,6 +5,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 import time
+from datetime import datetime, timedelta, timezone
 
 # --- 常量定义 ---
 # Gradescope 的主页和登录相关的 URL
@@ -156,92 +157,87 @@ def get_courses(session: requests.Session) -> list[dict[str, str]]:
 
 def get_assignments(session: requests.Session, course_url: str) -> list[dict[str, str]]:
     """
-    Fetches the list of unsubmitted assignments for a specific course.
-
-    Args:
-        session: The logged-in requests session.
-        course_url: The URL of the course to scrape.
-
-    Returns:
-        A list of dictionaries, where each dictionary represents an
-        unsubmitted assignment and contains its name, link, status, and due date.
+    获取课程作业，并过滤掉已过期超过 24 小时的未提交作业。
     """
     print(f"Fetching assignments from {course_url}...")
-    # Use safe_request with retries and timeout
     response = safe_request(session, "get", course_url)
     if response is None:
-        print(f"Error fetching assignments page for {course_url}: 多次尝试均未成功。")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
     unsubmitted_assignments = []
 
-    # 1. 安全地定位到表格主体
     table_body = soup.select_one("table#assignments-student-table tbody")
     if not isinstance(table_body, Tag):
-        print("错误：在页面上未能找到作业表格主体 (tbody)。")
         return []
 
-    # 2. 安全地遍历每一行
-    # 通过 list() 转换，让类型检查器明确知道这是一个列表
     assignment_rows = list(table_body.find_all("tr", recursive=False))
-    print(f"在表格中找到了 {len(assignment_rows)} 个作业条目，正在筛选...")
+    
+    # 获取当前带时区的时间（UTC）
+    now = datetime.now(timezone.utc)
 
     for row in assignment_rows:
-        # 确保 row 是一个 Tag 对象
         if not isinstance(row, Tag):
             continue
 
-                # --- 全新的、更健壮的信息提取与筛选逻辑 ---
-
         # 1. 提取名称和链接
-        name, link = None, None
         name_th = row.find("th", scope="row")
-        if isinstance(name_th, Tag):
-            name = name_th.get_text(strip=True)
-            link_a = name_th.find("a")
-            if isinstance(link_a, Tag):
-                href = link_a.get("href")
-                if isinstance(href, str):
-                    link = BASE_URL + href
-        
-        if not name:
-            continue
+        if not name_th: continue
+        name = name_th.get_text(strip=True)
+        link_a = name_th.find("a")
+        href = link_a.get("href") if link_a else None
+        link = BASE_URL + href if href and isinstance(href, str) else course_url
 
-        if not link:
-            # 如果没有作业链接（常见于未提交或未开放的作业），使用课程链接作为回退
-            link = course_url
-
-        # 2. 重新设计的状态和日期提取
-        is_completed = False
-        status_text = ""
-        due_date = ""
+        # 2. 判断状态是否为 "No Submission"
         all_tds = row.find_all("td")
-
-        # 状态单元格是第一个 <td>
-        if len(all_tds) > 0:
-            status_td = all_tds[0]
-            if isinstance(status_td, Tag):
-                status_text = status_td.get_text(strip=True)
-
-                # --- 智能筛选逻辑 ---
-                # 状态不是 "No Submission"
-                if "No Submission" not in status_text:
-                    is_completed = True
+        if not all_tds: continue
         
-        # 截止日期单元格是倒数第二个 <td>
-        if len(all_tds) >= 2:
-            due_date_td = all_tds[-2]
-            if isinstance(due_date_td, Tag):
-                due_date = due_date_td.get_text(strip=True)
+        status_text = all_tds[0].get_text(strip=True)
+        if "No Submission" not in status_text:
+            continue # 已提交，跳过
 
-        # 3. 根据筛选结果决定是否添加
-        if not is_completed:
+        # 3. 提取截止日期并进行时间比对
+        due_date_text = ""
+        is_too_late = False
+        
+        # 在倒数第二个单元格查找 <time> 标签
+        due_date_td = all_tds[-2]
+        time_tag = due_date_td.find("time", class_="submissionTimeChart--dueDate")
+        
+        if isinstance(time_tag, Tag):
+            # 获取类似 "2026-01-25 23:59:00 +0800" 的字符串
+            datetime_str = time_tag.get("datetime")
+            due_date_text = time_tag.get_text(strip=True) # 用于邮件显示的文字版
+
+            if isinstance(datetime_str, str):
+                try:
+                    # 将字符串转换为带时区的 datetime 对象
+                    # 注意：Gradescope 的格式可能是 "YYYY-MM-DD HH:MM:SS +HHMM"
+                    # 我们先处理一下中间的空格，使其符合 ISO 格式
+                    iso_str = datetime_str[:10] + "T" + datetime_str[11:]
+                    # 如果末尾是 +0800 这种格式，改为 +08:00
+                    if " " in iso_str:
+                        iso_str = iso_str.replace(" ", "")
+                    if "+" in iso_str and ":" not in iso_str[-5:]:
+                        iso_str = iso_str[:-2] + ":" + iso_str[-2:]
+                        
+                    due_dt = datetime.fromisoformat(iso_str)
+
+                    # --- 核心判断逻辑 ---
+                    # 如果 当前时间 > (截止时间 + 24小时)，则认为过期太久，不再提醒
+                    if now > (due_dt + timedelta(hours=24)):
+                        print(f"  [跳过] 作业 '{name}' 已过期超过 24h (Due: {due_date_text})")
+                        is_too_late = True
+                except Exception as e:
+                    print(f"  [警告] 解析日期出错 '{datetime_str}': {e}")
+
+        # 如果没有过期太久，则加入通知列表
+        if not is_too_late:
             unsubmitted_assignments.append({
                 "name": name,
                 "link": link,
                 "status": status_text,
-                "due_date": due_date
+                "due_date": due_date_text
             })
 
     return unsubmitted_assignments
